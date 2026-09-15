@@ -1,0 +1,50 @@
+name: Registrar webhook Telegram
+
+on:
+  workflow_dispatch:
+
+jobs:
+  registrar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Registrar webhook de Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_URL: ${{ secrets.TELEGRAM_WEBHOOK_URL }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+          webhook_url = os.environ["TELEGRAM_WEBHOOK_URL"].strip()
+          webhook_secret = os.environ["TELEGRAM_WEBHOOK_SECRET"].strip()
+
+          if not token or not webhook_url or not webhook_secret:
+              raise SystemExit("Faltan secretos para registrar el webhook")
+
+          endpoint = f"https://api.telegram.org/bot{token}/setWebhook"
+          payload = json.dumps({
+              "url": webhook_url,
+              "secret_token": webhook_secret,
+              "allowed_updates": ["message"],
+              "drop_pending_updates": True,
+          }).encode("utf-8")
+
+          request = urllib.request.Request(
+              endpoint,
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              result = json.loads(response.read().decode("utf-8"))
+
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+
+          if not result.get("ok"):
+              raise SystemExit("Telegram rechazó el webhook")
+          PY
