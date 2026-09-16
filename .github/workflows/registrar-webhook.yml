@@ -7,6 +7,42 @@ jobs:
   registrar:
     runs-on: ubuntu-latest
     steps:
+      - name: Validar configuración
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_URL: ${{ secrets.TELEGRAM_WEBHOOK_URL }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          required = {
+              "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
+              "TELEGRAM_WEBHOOK_URL": os.getenv("TELEGRAM_WEBHOOK_URL", ""),
+              "TELEGRAM_WEBHOOK_SECRET": os.getenv("TELEGRAM_WEBHOOK_SECRET", ""),
+          }
+
+          missing = [name for name, value in required.items() if not value.strip()]
+          if missing:
+              print("FALTAN SECRETOS EN GITHUB:", ", ".join(missing))
+              sys.exit(1)
+
+          webhook_url = required["TELEGRAM_WEBHOOK_URL"].strip()
+          webhook_secret = required["TELEGRAM_WEBHOOK_SECRET"].strip()
+
+          if not webhook_url.startswith("https://"):
+              print("TELEGRAM_WEBHOOK_URL debe comenzar con https://")
+              sys.exit(1)
+
+          if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", webhook_secret):
+              print("TELEGRAM_WEBHOOK_SECRET contiene caracteres no permitidos. Usa solo letras, numeros, _ y -")
+              sys.exit(1)
+
+          print("Configuracion basica OK")
+          PY
+
       - name: Registrar webhook de Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -16,14 +52,13 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import sys
+          import urllib.error
           import urllib.request
 
           token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
           webhook_url = os.environ["TELEGRAM_WEBHOOK_URL"].strip()
           webhook_secret = os.environ["TELEGRAM_WEBHOOK_SECRET"].strip()
-
-          if not token or not webhook_url or not webhook_secret:
-              raise SystemExit("Faltan secretos para registrar el webhook")
 
           endpoint = f"https://api.telegram.org/bot{token}/setWebhook"
           payload = json.dumps({
@@ -40,11 +75,18 @@ jobs:
               method="POST",
           )
 
-          with urllib.request.urlopen(request, timeout=30) as response:
-              result = json.loads(response.read().decode("utf-8"))
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  body = response.read().decode("utf-8")
+                  result = json.loads(body)
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode("utf-8", errors="replace")
+              print("Telegram HTTP error:", exc.code)
+              print(body)
+              sys.exit(1)
 
           print(json.dumps(result, indent=2, ensure_ascii=False))
 
           if not result.get("ok"):
-              raise SystemExit("Telegram rechazó el webhook")
+              raise SystemExit("Telegram rechazo el webhook")
           PY
