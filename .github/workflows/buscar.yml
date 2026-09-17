@@ -31,6 +31,8 @@ jobs:
           JOBBOT_MIN_SCORE: "50"
           JOBBOT_MAX_LINKS_PER_SEARCH: "15"
           JOBBOT_MAX_TELEGRAM_RESULTS: "8"
+          JOBBOT_FORCE_SHOW: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          JOBBOT_NOTIFY_SUMMARY: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python main.py
 
       - name: Guardar historial de ofertas vistas
