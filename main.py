@@ -63,6 +63,8 @@ TITLE_PENALTIES = {
 MIN_SCORE = int(os.getenv("JOBBOT_MIN_SCORE", "50"))
 MAX_LINKS_PER_SEARCH = int(os.getenv("JOBBOT_MAX_LINKS_PER_SEARCH", "15"))
 MAX_TELEGRAM_RESULTS = int(os.getenv("JOBBOT_MAX_TELEGRAM_RESULTS", "8"))
+FORCE_SHOW = os.getenv("JOBBOT_FORCE_SHOW", "0").strip() == "1"
+NOTIFY_SUMMARY = os.getenv("JOBBOT_NOTIFY_SUMMARY", "0").strip() == "1"
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -108,11 +110,9 @@ def fetch_html(url: str) -> str:
 
 
 def collect_job_links(search_url: str) -> list[str]:
-    html = fetch_html(search_url)
-    soup = BeautifulSoup(html, "html.parser")
-
+    soup = BeautifulSoup(fetch_html(search_url), "html.parser")
     links = []
-    seen = set()
+    local_seen = set()
 
     for tag in soup.find_all("a", href=True):
         href = tag.get("href", "")
@@ -120,9 +120,11 @@ def collect_job_links(search_url: str) -> list[str]:
             continue
 
         url = urljoin(BASE_URL, href).split("#", 1)[0]
-        if url not in seen:
-            seen.add(url)
-            links.append(url)
+        if url in local_seen:
+            continue
+
+        local_seen.add(url)
+        links.append(url)
 
         if len(links) >= MAX_LINKS_PER_SEARCH:
             break
@@ -131,12 +133,11 @@ def collect_job_links(search_url: str) -> list[str]:
 
 
 def extract_salary(text: str) -> str:
-    patterns = [
+    for pattern in (
         r"S/\.\s*[\d\.,]+\s*\(Mensual\)",
         r"S/\.\s*[\d\.,]+\s*-\s*S/\.\s*[\d\.,]+",
         r"S/\.\s*[\d\.,]+",
-    ]
-    for pattern in patterns:
+    ):
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
             return clean(match.group(0))
@@ -144,9 +145,7 @@ def extract_salary(text: str) -> str:
 
 
 def parse_job(url: str) -> dict | None:
-    html = fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
-
+    soup = BeautifulSoup(fetch_html(url), "html.parser")
     main = soup.find("main") or soup
     h1 = main.find("h1")
     if not h1:
@@ -210,10 +209,27 @@ def score_job(job: dict) -> tuple[int, list[str], list[str]]:
     return score, matched, missing_core
 
 
-def send_telegram(job: dict, score: int, matched: list[str], missing: list[str]) -> None:
+def telegram_request(payload: dict) -> None:
     if not TOKEN or not CHAT_ID:
         raise RuntimeError("Faltan TELEGRAM_BOT_TOKEN o TELEGRAM_CHAT_ID en GitHub Secrets")
 
+    endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    response = requests.post(endpoint, json=payload, timeout=20)
+    response.raise_for_status()
+
+
+def send_text(text: str) -> None:
+    telegram_request(
+        {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+    )
+
+
+def send_job(job: dict, score: int, matched: list[str], missing: list[str]) -> None:
     matched_text = ", ".join(matched[:8]) or "Coincidencia por título/perfil"
     missing_text = ", ".join(missing[:4]) or "Sin faltantes principales detectados"
 
@@ -225,37 +241,39 @@ def send_telegram(job: dict, score: int, matched: list[str], missing: list[str])
         f"🎯 <b>Compatibilidad: {score}%</b>\n"
         f"✅ Coincide: {escape(matched_text)}\n"
         f"⚠️ Faltantes: {escape(missing_text)}\n\n"
-        f"🔎 Revísala y postula tú mismo desde el enlace."
+        "🔎 Revísala y postula tú mismo desde el enlace."
     )
 
-    endpoint = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "reply_markup": {
-            "inline_keyboard": [
-                [{"text": "🔗 Ver y postular", "url": job["url"]}]
-            ]
-        },
-    }
-
-    response = requests.post(endpoint, json=payload, timeout=20)
-    response.raise_for_status()
+    telegram_request(
+        {
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": {
+                "inline_keyboard": [
+                    [{"text": "🔗 Ver y postular", "url": job["url"]}]
+                ]
+            },
+        }
+    )
 
 
 def main() -> None:
     seen = load_seen()
-    discovered = []
+    candidates = []
     all_links = []
     unique_links = set()
+    source_errors = 0
+
+    print(f"Modo manual/forzado: {FORCE_SHOW}")
 
     for search_url in SEARCH_URLS:
         try:
             links = collect_job_links(search_url)
             print(f"{search_url}: {len(links)} ofertas encontradas")
         except Exception as exc:
+            source_errors += 1
             print(f"Error buscando {search_url}: {exc}")
             continue
 
@@ -265,7 +283,7 @@ def main() -> None:
                 all_links.append(link)
 
     for url in all_links:
-        if url in seen:
+        if not FORCE_SHOW and url in seen:
             continue
 
         try:
@@ -273,26 +291,31 @@ def main() -> None:
             if not job:
                 continue
             score, matched, missing = score_job(job)
-            discovered.append((score, job, matched, missing))
+            candidates.append((score, job, matched, missing))
         except Exception as exc:
             print(f"Error leyendo {url}: {exc}")
 
-    discovered.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(key=lambda item: item[0], reverse=True)
 
     sent = 0
-    for score, job, matched, missing in discovered:
-        # Marcamos como vista aunque tenga puntuación baja para no reprocesarla eternamente.
-        seen.add(job["url"])
+    compatible = 0
 
+    for score, job, matched, missing in candidates:
         if score < MIN_SCORE:
+            seen.add(job["url"])
             print(f"{score}% | omitida | {job['title']}")
             continue
 
+        compatible += 1
+
         if sent >= MAX_TELEGRAM_RESULTS:
+            # No la marcamos como vista para que una ejecución automática futura
+            # todavía pueda enviarla si no fue mostrada.
             continue
 
         try:
-            send_telegram(job, score, matched, missing)
+            send_job(job, score, matched, missing)
+            seen.add(job["url"])
             sent += 1
             print(f"{score}% | enviada | {job['title']}")
             time.sleep(0.7)
@@ -300,7 +323,31 @@ def main() -> None:
             print(f"Error enviando Telegram: {exc}")
 
     save_seen(seen)
-    print(f"Listo. Nuevas analizadas: {len(discovered)} | Enviadas: {sent}")
+
+    print(
+        f"Listo. URLs: {len(all_links)} | Analizadas: {len(candidates)} | "
+        f"Compatibles: {compatible} | Enviadas: {sent}"
+    )
+
+    if NOTIFY_SUMMARY:
+        if not all_links:
+            send_text(
+                "⚠️ <b>Búsqueda terminada</b>\n\n"
+                "No pude extraer ofertas de Computrabajo en esta ejecución. "
+                f"Fuentes con error: {source_errors}."
+            )
+        elif sent > 0:
+            send_text(
+                "✅ <b>Búsqueda terminada</b>\n\n"
+                f"Revisé {len(candidates)} ofertas y te envié {sent} "
+                f"con compatibilidad de {MIN_SCORE}% o más."
+            )
+        else:
+            send_text(
+                "✅ <b>Búsqueda terminada</b>\n\n"
+                f"Revisé {len(candidates)} ofertas, pero ninguna superó "
+                f"el filtro de {MIN_SCORE}% en esta ejecución."
+            )
 
 
 if __name__ == "__main__":
